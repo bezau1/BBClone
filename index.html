@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>block clone</title>
+<meta name="theme-color" content="#11111b">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+  @font-face { font-family:'m6x11'; src:url('m6x11-webfont.woff') format('woff'); }
+  :root {
+    /* catppuccin mocha */
+    --base:#1e1e2e; --mantle:#181825; --crust:#11111b; --text:#cdd6f4; --subtext1:#bac2de;
+    --surface0:#313244; --surface1:#45475a; --surface2:#585b70; --green:#a6e3a1; --yellow:#f9e2af; --red:#f38ba8;
+  }
+  * { box-sizing:border-box; border-radius:0 !important; touch-action:none; user-select:none; -webkit-user-select:none; }
+  html,body { margin:0; height:100%; overflow:hidden; overscroll-behavior:none; background:var(--crust); color:var(--text); font-family:'m6x11',monospace; font-size:20px; -webkit-tap-highlight-color:transparent; -webkit-touch-callout:none; }
+  #app { height:100vh; height:100dvh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2vh;
+    padding:max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); }
+  #score { text-align:center; font-size:clamp(48px, 9vh, 84px); line-height:1; color:var(--green); }
+  .frame { background:var(--base); border:3px solid var(--surface1); box-shadow:6px 6px 0 var(--crust); padding:0; width:fit-content; margin:0 auto; }
+  canvas { display:block; image-rendering:pixelated; cursor:grab; }
+  canvas.dragging { cursor:grabbing; }
+  #overlay { position:fixed; inset:0; background:#11111bcc; display:none; align-items:center; justify-content:center; }
+  #overlay.show { display:flex; }
+  #overlay .box { background:var(--base); border:3px solid var(--red); box-shadow:6px 6px 0 var(--crust); text-align:center; min-width:260px; padding:22px; display:flex; flex-direction:column; gap:14px; }
+  #overlay h1 { margin:0; font-size:40px; font-weight:normal; color:var(--red); }
+  #final { font-size:26px; color:var(--yellow); }
+  button { font-family:'m6x11',monospace; font-size:24px; background:var(--surface0); color:var(--text); border:3px solid var(--surface2); padding:10px 16px; cursor:pointer; box-shadow:4px 4px 0 var(--crust); transition:transform .08s, box-shadow .08s, color .15s, border-color .15s; }
+  #bar { min-height:54px; display:flex; align-items:center; justify-content:center; gap:12px; font-size:22px; color:var(--subtext1); }
+  #bar button, #overlay .box button { font-size:20px; padding:8px 14px; }
+  #replayBar { display:flex; align-items:center; gap:12px; }
+  [hidden] { display:none !important; }
+  button:hover { color:var(--green); border-color:var(--green); }
+  button:active { transform:translate(3px,3px); box-shadow:1px 1px 0 var(--crust); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="score">0</div>
+  <div class="frame"><canvas id="c"></canvas></div>
+  <div id="bar">
+    <button id="menuBtn" hidden>show menu</button>
+    <div id="replayBar" hidden><span id="replayText"></span><button id="replayNext">next</button><button id="replayBack">back</button></div>
+  </div>
+</div>
+<div id="overlay">
+  <div class="box">
+    <h1>game over</h1>
+    <div id="final"></div>
+    <button id="again">play again</button>
+    <button id="showWin">how you could've won</button>
+    <button id="hideMenu">hide menu</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const N = 8;
+  const COLORS = ['#f38ba8','#fab387','#f9e2af','#a6e3a1','#94e2d5','#89b4fa','#cba6f7','#f5c2e7'];
+
+  // Base shapes (taken from the Block Blast calculator's BASES list); every distinct
+  // rotation/mirror becomes its own piece, since pieces cannot be rotated in play.
+  const BASE = [
+    ['X'], ['XX'], ['XXX'], ['XXXX'], ['XXXXX'],
+    ['XX', 'XX'], ['XXX', 'XXX', 'XXX'], ['XXX', 'XXX'],
+    ['X.', 'XX'], ['X..', 'X..', 'XXX'], ['X.', 'X.', 'XX'],
+    ['XXX', '.X.'], ['XX.', '.XX'], ['XX', 'X.', 'X.'],
+    ['XXX', 'X..', 'X..'], ['XX', 'XX', 'X.'], ['XX', 'X.', 'XX'],
+  ];
+
+  const norm = cells => {
+    const minR = Math.min(...cells.map(c => c[0])), minC = Math.min(...cells.map(c => c[1]));
+    return cells.map(([r, c]) => [r - minR, c - minC]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  };
+  const key = cells => cells.map(c => c.join(',')).join(';');
+  const rot = cells => norm(cells.map(([r, c]) => [c, -r]));
+  const mirror = cells => norm(cells.map(([r, c]) => [r, -c]));
+
+  const SHAPES = [];
+  const seen = new Set();
+  for (const rows of BASE) {
+    let cells = [];
+    rows.forEach((row, r) => [...row].forEach((ch, c) => { if (ch === 'X') cells.push([r, c]); }));
+    cells = norm(cells);
+    for (const m of [cells, mirror(cells)]) {
+      let cur = m;
+      for (let i = 0; i < 4; i++) {
+        const k = key(cur);
+        if (!seen.has(k)) { seen.add(k); SHAPES.push(cur); }
+        cur = rot(cur);
+      }
+    }
+  }
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const overlay = document.getElementById('overlay');
+  const menuBtn = document.getElementById('menuBtn'), replayBar = document.getElementById('replayBar');
+  const showWinBtn = document.getElementById('showWin');
+
+  let grid, hand, score, drag = null, over = false, lastDeal = null, replay = null;
+
+  let W, CELL, BOARD, TRAY_Y, TRAY_H;
+  function layout() {
+    const dpr = window.devicePixelRatio || 1;
+    const app = document.getElementById('app'), cs = getComputedStyle(app);
+    const availW = window.innerWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 12;
+    const availH = window.innerHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - scoreEl.offsetHeight - document.getElementById('bar').offsetHeight - window.innerHeight * 0.04 - 12;
+    // canvas is the board plus a tray of 4 rows and a small gap = N + 4.6 cells tall
+    CELL = Math.max(16, Math.floor(Math.min(availW / N, availH / (N + 4.6), 80)));
+    BOARD = CELL * N;
+    TRAY_H = CELL * 4;
+    TRAY_Y = BOARD + CELL * 0.6;
+    W = BOARD;
+    canvas.style.width = W + 'px';
+    canvas.style.height = (TRAY_Y + TRAY_H) + 'px';
+    canvas.width = W * dpr;
+    canvas.height = (TRAY_Y + TRAY_H) * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    draw();
+  }
+
+  const rand = n => Math.floor(Math.random() * n);
+  const bounds = cells => ({ h: Math.max(...cells.map(c => c[0])) + 1, w: Math.max(...cells.map(c => c[1])) + 1 });
+
+  // ---- solvability: every new hand must have a way to place all three pieces ----
+  // Adapted from the calculator's solver: try every piece order and every placement,
+  // applying line clears between pieces, and stop at the first full solution.
+  const flatFrom = g => { const f = new Uint8Array(N * N); for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) f[r * N + c] = g[r][c] ? 1 : 0; return f; };
+  const flat = () => flatFrom(grid);
+
+  function simPlace(f, cells, r0, c0) {
+    for (const [r, c] of cells) {
+      const rr = r0 + r, cc = c0 + c;
+      if (rr < 0 || rr >= N || cc < 0 || cc >= N || f[rr * N + cc]) return null;
+    }
+    const g = f.slice();
+    for (const [r, c] of cells) g[(r0 + r) * N + c0 + c] = 1;
+    const rows = [], cols = [];
+    for (let i = 0; i < N; i++) {
+      let rf = true, cf = true;
+      for (let j = 0; j < N; j++) { if (!g[i * N + j]) rf = false; if (!g[j * N + i]) cf = false; }
+      if (rf) rows.push(i);
+      if (cf) cols.push(i);
+    }
+    for (const r of rows) for (let c = 0; c < N; c++) g[r * N + c] = 0;
+    for (const c of cols) for (let r = 0; r < N; r++) g[r * N + c] = 0;
+    return g;
+  }
+
+  function solve(f, pieces, budget) {
+    if (!pieces.length) return true;
+    const seen = new Set();
+    for (let i = 0; i < pieces.length; i++) {
+      const k = key(pieces[i]);
+      if (seen.has(k)) continue; // identical shapes: one order is enough
+      seen.add(k);
+      const rest = pieces.filter((_, j) => j !== i);
+      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        if (--budget.n < 0) return true; // wide-open board: too big to search, solvable in practice
+        const g = simPlace(f, pieces[i], r, c);
+        if (g && solve(g, rest, budget)) return true;
+      }
+    }
+    return false;
+  }
+  const solvable = pieces => solve(flat(), pieces, { n: 200000 });
+
+  // Same search, but returns the winning moves: [{ i: piece index, r, c }, ...] in play order.
+  function solvePath(f, idx, pieces, budget) {
+    if (!idx.length) return [];
+    const seen = new Set();
+    for (const i of idx) {
+      const k = key(pieces[i]);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      const rest = idx.filter(j => j !== i);
+      for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+        if (--budget.n < 0) return null;
+        const g = simPlace(f, pieces[i], r, c);
+        if (!g) continue;
+        const sub = solvePath(g, rest, pieces, budget);
+        if (sub) return [{ i, r, c }, ...sub];
+      }
+    }
+    return null;
+  }
+
+  function deal() {
+    // 3 random shapes, re-rolled until the hand can be fully placed.
+    let best = null, bestFit = -1, found = false;
+    const startGrid = grid.map(row => row.slice());
+    for (let tries = 0; tries < 300; tries++) {
+      const cells = [0, 1, 2].map(() => SHAPES[rand(SHAPES.length)]);
+      if (solvable(cells)) { best = cells; found = true; break; }
+      const fit = cells.filter(fitsAnywhere).length;
+      if (fit > bestFit) { best = cells; bestFit = fit; }
+    }
+    // (If no solvable hand exists the board is already lost; the best-fitting hand is dealt.)
+    hand = best.map(cells => ({ cells, color: COLORS[rand(COLORS.length)], used: false }));
+    lastDeal = { grid: startGrid, hand: hand.map(p => ({ cells: p.cells, color: p.color })), solvable: found };
+  }
+
+  function canPlace(cells, r0, c0) {
+    return cells.every(([r, c]) => {
+      const rr = r0 + r, cc = c0 + c;
+      return rr >= 0 && rr < N && cc >= 0 && cc < N && !grid[rr][cc];
+    });
+  }
+  const fitsAnywhere = cells => {
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (canPlace(cells, r, c)) return true;
+    return false;
+  };
+
+  function reset() {
+    grid = Array.from({ length: N }, () => Array(N).fill(null));
+    score = 0; over = false; drag = null;
+    overlay.classList.remove('show');
+    replay = null; replayBar.hidden = true; menuBtn.hidden = true;
+    deal(); updateHud(); draw();
+  }
+
+  function updateHud() {
+    scoreEl.textContent = score;
+  }
+
+  function place(piece, r0, c0) {
+    for (const [r, c] of piece.cells) grid[r0 + r][c0 + c] = piece.color;
+    piece.used = true;
+    let gained = piece.cells.length;
+
+    const rows = [], cols = [];
+    for (let i = 0; i < N; i++) {
+      if (grid[i].every(Boolean)) rows.push(i);
+      if (grid.every(row => row[i])) cols.push(i);
+    }
+    const lines = rows.length + cols.length;
+    for (const r of rows) for (let c = 0; c < N; c++) grid[r][c] = null;
+    for (const c of cols) for (let r = 0; r < N; r++) grid[r][c] = null;
+    if (lines) gained += lines * 10 * lines;
+    score += gained;
+
+    if (hand.every(p => p.used)) deal();
+    updateHud();
+
+    if (!hand.some(p => !p.used && fitsAnywhere(p.cells))) {
+      over = true;
+      document.getElementById('final').textContent = 'score: ' + score;
+      showWinBtn.hidden = !(lastDeal && lastDeal.solvable);
+      overlay.classList.add('show');
+    }
+  }
+
+  // Slot geometry for the tray
+  function slotRect(i) {
+    const sw = W / 3;
+    return { x: i * sw, y: TRAY_Y, w: sw, h: TRAY_H };
+  }
+  const TRAY_SCALE = 0.55;
+
+  function pieceOrigin(i, cells) {
+    const s = slotRect(i), { h, w } = bounds(cells), cs = CELL * TRAY_SCALE;
+    return { x: s.x + (s.w - w * cs) / 2, y: s.y + (s.h - h * cs) / 2, cs };
+  }
+
+  function drawCell(x, y, s, color, alpha = 1) {
+    // beveled tile: lit top/left, shaded bottom/right
+    const w = Math.max(2, Math.round(s * 0.11)), x2 = x + s, y2 = y + s;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color; ctx.fillRect(x, y, s, s);
+    const poly = (fill, pts) => { ctx.fillStyle = fill; ctx.beginPath(); ctx.moveTo(pts[0], pts[1]); for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]); ctx.closePath(); ctx.fill(); };
+    poly('#ffffff55', [x, y, x2, y, x2 - w, y + w, x + w, y + w]);
+    poly('#ffffff2a', [x, y, x + w, y + w, x + w, y2 - w, x, y2]);
+    poly('#00000059', [x, y2, x + w, y2 - w, x2 - w, y2 - w, x2, y2]);
+    poly('#00000038', [x2, y, x2, y2, x2 - w, y2 - w, x2 - w, y + w]);
+    ctx.globalAlpha = 1;
+  }
+
+  function dropTarget() {
+    if (!drag) return null;
+    const { h, w } = bounds(drag.piece.cells);
+    const c0 = Math.round((drag.x - (w * CELL) / 2) / CELL);
+    const r0 = Math.round((drag.y - (h * CELL) / 2) / CELL);
+    return { r0, c0, ok: canPlace(drag.piece.cells, r0, c0) };
+  }
+
+  // Frames of the winning line: the board after each move (before its clears), with the new cells marked.
+  function buildFrames(path) {
+    const g = lastDeal.grid.map(row => row.slice()), frames = [];
+    path.forEach((st, n) => {
+      const p = lastDeal.hand[st.i], placed = new Set();
+      for (const [r, c] of p.cells) { g[st.r + r][st.c + c] = p.color; placed.add((st.r + r) * N + st.c + c); }
+      const rows = [], cols = [];
+      for (let i = 0; i < N; i++) {
+        if (g[i].every(Boolean)) rows.push(i);
+        if (g.every(row => row[i])) cols.push(i);
+      }
+      frames.push({ grid: g.map(row => row.slice()), placed, lines: rows.length + cols.length, used: path.slice(0, n + 1).map(x => x.i) });
+      for (const r of rows) for (let c = 0; c < N; c++) g[r][c] = null;
+      for (const c of cols) for (let r = 0; r < N; r++) g[r][c] = null;
+    });
+    return frames;
+  }
+
+  function drawReplay() {
+    const f = replay.frames[replay.step];
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#181825'; ctx.fillRect(0, 0, BOARD, BOARD);
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      if (f.grid[r][c]) drawCell(c * CELL, r * CELL, CELL, f.grid[r][c]);
+      else { ctx.fillStyle = '#313244'; ctx.fillRect(c * CELL + 2, r * CELL + 2, CELL - 4, CELL - 4); }
+    }
+    ctx.strokeStyle = '#cdd6f4'; ctx.lineWidth = 3;
+    f.placed.forEach(k => ctx.strokeRect((k % N) * CELL + 2, Math.floor(k / N) * CELL + 2, CELL - 4, CELL - 4));
+    lastDeal.hand.forEach((p, i) => {
+      const o = pieceOrigin(i, p.cells), done = f.used.includes(i);
+      for (const [r, c] of p.cells) drawCell(o.x + c * o.cs, o.y + r * o.cs, o.cs, p.color, done ? 0.25 : 1);
+    });
+  }
+
+  function updateReplayBar() {
+    const f = replay.frames[replay.step];
+    document.getElementById('replayText').textContent = 'move ' + (replay.step + 1) + '/' + replay.frames.length + (f.lines ? ' · clears ' + f.lines : '');
+  }
+
+  function draw() {
+    if (!grid) return;
+    if (replay) { drawReplay(); return; }
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#181825'; ctx.fillRect(0, 0, BOARD, BOARD);
+
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      if (grid[r][c]) drawCell(c * CELL, r * CELL, CELL, grid[r][c]);
+      else { ctx.fillStyle = '#313244'; ctx.fillRect(c * CELL + 2, r * CELL + 2, CELL - 4, CELL - 4); }
+    }
+
+    const t = dropTarget();
+    if (t && t.ok) for (const [r, c] of drag.piece.cells) drawCell((t.c0 + c) * CELL, (t.r0 + r) * CELL, CELL, drag.piece.color, 0.4);
+
+    hand.forEach((p, i) => {
+      if (p.used || (drag && drag.index === i)) return;
+      const o = pieceOrigin(i, p.cells);
+      const dim = !fitsAnywhere(p.cells);
+      for (const [r, c] of p.cells) drawCell(o.x + c * o.cs, o.y + r * o.cs, o.cs, p.color, dim ? 0.35 : 1);
+    });
+
+    if (drag) {
+      const { h, w } = bounds(drag.piece.cells);
+      const ox = drag.x - (w * CELL) / 2, oy = drag.y - (h * CELL) / 2;
+      for (const [r, c] of drag.piece.cells) drawCell(ox + c * CELL, oy + r * CELL, CELL, drag.piece.color);
+    }
+  }
+
+  function pos(e) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: (e.clientX - rect.left) * (W / rect.width), y: (e.clientY - rect.top) * (W / rect.width) };
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    if (over) return;
+    const p = pos(e);
+    hand.forEach((piece, i) => {
+      if (piece.used || drag) return;
+      const s = slotRect(i);
+      if (p.x >= s.x && p.x < s.x + s.w && p.y >= s.y && p.y < s.y + s.h) {
+        const lift = e.pointerType === 'mouse' ? 0 : CELL * 1.5; // touch: lift above the finger
+        drag = { piece, index: i, lift, x: p.x, y: p.y - lift };
+        canvas.classList.add('dragging');
+        canvas.setPointerCapture(e.pointerId);
+      }
+    });
+    draw();
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const p = pos(e);
+    drag.x = p.x; drag.y = p.y - drag.lift;
+    draw();
+  });
+  const end = () => {
+    if (!drag) return;
+    const t = dropTarget();
+    const piece = drag.piece;
+    drag = null;
+    canvas.classList.remove('dragging');
+    if (t && t.ok) place(piece, t.r0, t.c0);
+    draw();
+  };
+  canvas.addEventListener('pointerup', end);
+  canvas.addEventListener('pointercancel', () => { drag = null; canvas.classList.remove('dragging'); draw(); });
+  window.addEventListener('contextmenu', e => e.preventDefault());
+
+  document.getElementById('again').addEventListener('click', reset);
+  document.getElementById('hideMenu').addEventListener('click', () => { overlay.classList.remove('show'); menuBtn.hidden = false; });
+  menuBtn.addEventListener('click', () => { overlay.classList.add('show'); menuBtn.hidden = true; });
+  showWinBtn.addEventListener('click', () => {
+    const pieces = lastDeal.hand.map(p => p.cells);
+    const path = solvePath(flatFrom(lastDeal.grid), [0, 1, 2], pieces, { n: 3000000 });
+    if (!path) { showWinBtn.hidden = true; return; }
+    replay = { frames: buildFrames(path), step: 0 };
+    overlay.classList.remove('show');
+    replayBar.hidden = false;
+    updateReplayBar(); draw();
+  });
+  document.getElementById('replayNext').addEventListener('click', () => { replay.step = (replay.step + 1) % replay.frames.length; updateReplayBar(); draw(); });
+  document.getElementById('replayBack').addEventListener('click', () => { replay = null; replayBar.hidden = true; overlay.classList.add('show'); draw(); });
+  window.addEventListener('resize', layout);
+  reset();
+  layout();
+  window.__shapes = SHAPES.length;
+  window.__game = { get grid() { return grid; }, get hand() { return hand; }, get over() { return over; }, place, canPlace, solvable, reset, deal, shapes: SHAPES }; // test hook
+})();
+</script>
+</body>
+</html>
