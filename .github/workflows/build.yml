@@ -53,6 +53,8 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage
 
   ios:
+    # Produces an UNSIGNED .ipa. Install it by sideloading (Sideloadly / AltStore re-sign it with a
+    # free Apple ID). A normally installable .ipa needs a paid Apple developer account.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,11 +65,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
       - run: npm ci
       - run: npx tauri ios init --ci
-      - name: Show generated project
+      - name: Turn off code signing in the generated project
+        working-directory: src-tauri/gen/apple
         run: |
-          cd src-tauri/gen/apple
-          ls -la
-          echo ---- project.yml; cat project.yml
-          echo ---- ; xcodebuild -version; xcodegen --version || true
+          python3 - <<'PY'
+          import re
+          p = 'project.yml'
+          t = open(p).read()
+          t = re.sub(r'^( *)ENABLE_BITCODE: false$',
+                     lambda m: '\n'.join([m.group(0),
+                                          m.group(1) + 'CODE_SIGNING_ALLOWED: "NO"',
+                                          m.group(1) + 'CODE_SIGNING_REQUIRED: "NO"',
+                                          m.group(1) + 'CODE_SIGN_IDENTITY: ""']),
+                     t, flags=re.M)
+          open(p, 'w').write(t)
+          PY
+          grep -n -B1 -A3 CODE_SIGNING_ALLOWED project.yml
+          xcodegen generate
+      - name: Build (the export step is expected to fail without signing)
+        id: build
+        continue-on-error: true
+        run: npx tauri ios build --ci --target aarch64 --export-method debugging
+      - name: Package the .app as an unsigned .ipa
+        run: |
+          find src-tauri/gen/apple -name '*.app' -maxdepth 8 | head
+          APP=$(find src-tauri/gen/apple -name '*.app' -path '*xcarchive*' | head -1)
+          [ -n "$APP" ] || { echo "no .app found in the archive"; exit 1; }
+          rm -rf Payload && mkdir Payload && cp -R "$APP" Payload/
+          zip -qry BlockClone-unsigned.ipa Payload
+          ls -la BlockClone-unsigned.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlockClone-unsigned-ipa
+          path: BlockClone-unsigned.ipa
